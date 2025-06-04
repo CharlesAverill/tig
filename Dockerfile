@@ -45,7 +45,7 @@ RUN groupadd -g ${guest_gid} ${guest_name} \
     && useradd --no-log-init -m -s /bin/bash -g ${guest_name} -G sudo -p '' -u ${guest_uid} ${guest_name}
 
 
-COPY _run.sh /ghidra
+RUN mv /ghidra_scripts/_run.sh /ghidra
 RUN chmod +x /ghidra/_run.sh
 
 RUN chown -R ${guest_name}:${guest_name} /ghidra

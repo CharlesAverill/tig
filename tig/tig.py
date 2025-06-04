@@ -2,8 +2,8 @@ import argparse
 import json
 import os
 import subprocess
-from typing import Tuple, Optional, Dict
-from tig.extract_basic_blocks import extract_bb
+from typing import Tuple, Optional, Dict, List
+from tig.extract_basic_blocks import extract_bb, get_non_terminated_functions
 from tig.bininfo import Instruction, BasicBlock, Function
 from tig.symbolic_execution import get_project, exec_func
 
@@ -150,7 +150,11 @@ def time_of_basic_block(
         return f"{' + '.join(times + [parens(final_time)])}", None
 
 
-def generate_timing_invariants(bin_path: str, func: Function) -> Dict[int, str]:
+def generate_timing_invariants(bin_path: str, 
+                               func: Function,
+                               base_addr: int,
+                               no_term_func_addrs: List[int],
+                               ) -> Dict[int, str]:
     # Start up angr
 
     # Invariant points are:
@@ -163,11 +167,15 @@ def generate_timing_invariants(bin_path: str, func: Function) -> Dict[int, str]:
 
     # For each node
 
-    p = get_project(bin_path)
-    f = exec_func(p, func)
+    p = get_project(bin_path, base_addr)
+    f = exec_func(p, func, no_term_func_addrs, verbose=True)
     with open("paths.txt", "w") as file:
-        for x in f:
-            file.write(f"{x}\n")
+        for addr, c, sym_mem in f:
+            file.write(f"- {hex(addr)}\n")
+            file.write(f"{c}\n")
+            for sym,ptr in sym_mem.items():
+                file.write(f" - {sym}: {ptr}\n")
+            file.write("\n")
     # for block in func:
     #     print(f"====={block.start_vaddr}=====")
     #     print(exec_bb(p, block, []))
@@ -183,7 +191,6 @@ def main():
     parser.add_argument("func", type=str)
     parser.add_argument("--objdump", default="riscv32-unknown-elf-objdump", type=str)
     parser.add_argument("--disas", action="store_true")
-    parser.add_argument("--addr-offset", default=None, type=int)
     parser.add_argument("--out-file", default=None, type=str)
     args = parser.parse_args()
 
@@ -209,18 +216,15 @@ def main():
     else:
         with open(preproc_fn, "r") as file:
             data = json.load(file)
+
+    no_term_funcs = get_non_terminated_functions(data)
+    no_term_func_addrs = [addr for _,addr in no_term_funcs]
+
     func = Function([x for x in data if x["function_name"] == args.func][0])
 
-    # Add offset
-    if args.addr_offset is not None:
-        for block in func:
-            block.start_vaddr += args.addr_offset
-            block.exit_vaddrs = [a + args.addr_offset for a in block.exit_vaddrs]
-            block.source_vaddrs = [a + args.addr_offset for a in block.source_vaddrs]
-            for instr in block:
-                instr.offset += args.addr_offset
+    base_addr = data[0]["blocks"][0]["bb_start_vaddr"]
 
-    invs = generate_timing_invariants(args.bin, func)
+    invs = generate_timing_invariants(args.bin, func, base_addr, no_term_func_addrs)
 
     # invs = rocq_of_invariants(args.func, invs)
     # if args.out_file is None:

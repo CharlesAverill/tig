@@ -138,8 +138,8 @@ public class GetBasicBlocks extends HeadlessScript {
                         && successor_bb_addressRange.getMaxAddress().getOffset() <= function.getBody().getMaxAddress().getOffset()
                         )
                 {
+                    is_exit_point = false;
                     if(successor_bb_addressRange.getMinAddress().getOffset() > addressRange.getMaxAddress().getOffset()) {
-                        is_exit_point = false;
                         exit_vaddr = successor_bb_addressRange.getMinAddress().getOffset();
                         this.exit_vaddrs.add(Long.toUnsignedString(exit_vaddr));
                     }

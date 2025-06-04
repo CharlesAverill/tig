@@ -25,3 +25,9 @@ poetry run tig prog func
 to print out a list of angr constraints for each control-flow path.
 
 Invariant generation temporarily disabled
+
+## Install
+Build docker image for ghidra headless bb extraction
+```
+docker build -t ghidra-bbextract .
+```

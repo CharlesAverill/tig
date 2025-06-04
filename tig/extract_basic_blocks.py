@@ -3,7 +3,7 @@ import json
 import subprocess
 import re
 from subprocess import Popen, PIPE
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 
 def basic_extract_bb(binary_path: str) -> List[Dict[str, Any]]:
@@ -213,3 +213,20 @@ def extract_bb(
         json.dump(bb, fd, indent=2)
 
     return bb
+
+
+def get_non_terminated_functions(bb_data: List) -> List[Tuple[str,int]]:
+    no_terms = []
+    for function in bb_data:
+        has_exit = False
+        for block in function["blocks"]:
+            if block["is_exit_point"]:
+                has_exit = True
+                break
+        if not has_exit:
+            addr = function["blocks"][0]["bb_start_vaddr"]
+            func_name = function["function_name"]
+            no_terms.append((func_name, addr))
+            #print(hex(addr), func_name)
+    return no_terms
+

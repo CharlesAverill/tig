@@ -2,14 +2,19 @@ import pypcode, archinfo, angr, claripy
 from typing import List
 from tig.bininfo import Function
 import logging
+import copy
 
 logging.getLogger("angr").setLevel(logging.ERROR)
 logging.getLogger("claripy").setLevel(logging.ERROR)
 logging.getLogger("pyvex").setLevel(logging.ERROR)
 logging.getLogger("cle").setLevel(logging.ERROR)
 
+# NOTE: Customize memory overwrite
+import tig.memory_mixins
 
-def get_project(bin_path: str, lang: str = "RISCV:LE:32:default") -> angr.Project:
+def get_project(bin_path: str, 
+                base_addr: int,
+                lang: str = "RISCV:LE:32:default") -> angr.Project:
     """Get an angr Project using pypcode
 
     Args:
@@ -37,7 +42,12 @@ def get_project(bin_path: str, lang: str = "RISCV:LE:32:default") -> angr.Projec
 
     pcode_arch = archinfo.ArchPcode(sparc_lang)
 
-    return angr.Project(bin_path, arch=pcode_arch, auto_load_libs=False)
+    return angr.Project(bin_path, 
+                        arch=pcode_arch, 
+                        load_options={'auto_load_libs': False, 
+                                      'main_opts': {'base_addr': base_addr}
+                                      }
+                        )
 
 
 class StashMonitor(angr.exploration_techniques.ExplorationTechnique):
@@ -49,9 +59,9 @@ class StashMonitor(angr.exploration_techniques.ExplorationTechnique):
 
     def step(self, simgr, stash="active", **kwargs):
         # Print pre-step information
-        if self.verbose:
-            print("\nBefore step:")
-            self._print_stashes(simgr)
+        #if self.verbose:
+        #    print("\nBefore step:")
+        #    self._print_stashes(simgr)
 
         # Execute the step
         simgr = simgr.step(stash=stash, **kwargs)
@@ -107,22 +117,8 @@ def make_static_memory_symbolic(
 def make_registers_symbolic(
     project: angr.Project, state: angr.SimState, chunk_size: int = 4
 ):
-    # TODO: ugly
-    lang = "RISCV:LE:32:default"
-    sparc_lang = None
-    for arch in pypcode.Arch.enumerate():
-        for l in arch.languages:
-            if l.id == lang:
-                sparc_lang = l
-                break
-        if sparc_lang is not None:
-            break
-    if sparc_lang is None:
-        raise Exception(f"Unable to find SPARC language for {lang}")
-    arch = archinfo.ArchPcode(sparc_lang)
-
     import re
-
+    arch = project.arch
     # make registers symbolic: sp, ra, gp; a0...a?, s0...s?
     for reg_name in arch.registers:
         if not (re.match(r"(a|s)\d+", reg_name) or reg_name in ["sp", "ra", "gp"]):
@@ -131,12 +127,12 @@ def make_registers_symbolic(
         size_bits = size_bytes * 8
 
         sym_val = claripy.BVS(f"reg_{reg_name}", size_bits)
-
         # Write symbolic value to register
         state.registers.store(reg_name, sym_val)
     return state
 
 
+# NOTE: can be replaced with OpBehaviorLzcount overwrite in memory_mixins
 def is_clz(expr):
     """Determines if a given claripy AST expression implements a Count Leading Zeros (CLZ) operation.
 
@@ -203,6 +199,7 @@ def is_clz(expr):
         return None
 
 
+# NOTE: can be replaced with OpBehaviorLzcount overwrite in memory_mixins
 def replace_clz(expr):
     new_vars = []
     args = list(expr.args)  # Copy to avoid modifying the tuple directly
@@ -224,6 +221,7 @@ def replace_clz(expr):
     return expr, []
 
 
+# NOTE: can be replaced with OpBehaviorLzcount overwrite in memory_mixins
 class TIGSimplify(angr.exploration_techniques.ExplorationTechnique):
     """Exploration technique that simplifies constraints as steps occur"""
 
@@ -257,12 +255,111 @@ class TIGSimplify(angr.exploration_techniques.ExplorationTechnique):
         return simgr
 
 
-def exec_func(p: angr.Project, func: Function) -> List[claripy.ast.bool.Bool]:
+class NonTermAvoid(angr.exploration_techniques.ExplorationTechnique):
+    """ Directly remove a state if calling non-terminated functions """
+
+    def __init__(self, non_term_funcs=[], verbose=True):
+        super().__init__()
+        self.verbose = verbose
+        self.non_term_funcs = non_term_funcs
+
+
+    def step(self, simgr, stash="active", **kwargs):
+        # Execute the step
+        simgr = simgr.step(stash=stash, **kwargs)
+
+        for state in simgr.stashes.get(stash, []):
+            self._attach_hook(state)
+
+        simgr.move(
+            from_stash=stash,
+            to_stash='avoid',
+            filter_func=lambda s: s.globals.get('move_to_avoid', False)
+        )
+
+        return simgr
+    
+    def _attach_hook(self, state):
+        if state.globals.get('hook_attached'):
+            return
+        state.globals['hook_attached'] = True
+
+        def check_calling_non_term(state):
+            addr = state.solver.eval(state.inspect.function_address)
+            if addr in self.non_term_funcs:
+                print("+ killing", hex(addr))
+                state.globals['move_to_avoid'] = True
+
+        state.inspect.b("call", when=angr.BP_BEFORE, action=check_calling_non_term)
+
+
+def set_debug_inspect(state: angr.SimState) -> None:
+    """ Debug print """
+    def print_mem_write(state):
+        print(
+            " MEM Write", state.inspect.mem_write_expr, "to", state.inspect.mem_write_address
+        )
+
+    def print_reg_write(state):
+        reg_offset = state.inspect.reg_write_offset  # Get the register offset
+        reg_name = state.arch.register_names.get(reg_offset, f"Unknown({reg_offset})")
+        print(" REG Write", state.inspect.reg_write_expr, "to", reg_name)
+
+    def print_mem_read(state):
+        print(" MEM Read ", state.inspect.mem_read_expr, "from", state.inspect.mem_read_address)
+
+    def print_reg_read(state):
+        reg_offset = state.inspect.reg_read_offset  # Get the register offset
+        reg_name = state.arch.register_names.get(reg_offset, f"Unknown({reg_offset})")
+        print(" REG Read ", state.inspect.reg_read_expr, "from ", reg_name)
+
+    def print_addr(state):
+        print("->", hex(state.inspect.instruction))
+
+    def print_symvar(state):
+        print(" + NEW", state.inspect.symbolic_name)
+
+    def print_con(state):
+        con_result = state.inspect.address_concretization_result
+        if con_result is None:
+            result = "-"
+        else:
+            result = "[" + ",".join(hex(e) for e in con_result) + "]"
+        #print(state.solver.symbolic(state.inspect.address_concretization_expr))
+        print(" + CONCRETIZE:",
+              "\n\tStrategy:", state.inspect.address_concretization_strategy,
+              #"\n\tConcre Expr:", state.inspect.address_concretization_expr,
+              "\n\tResult:", result,
+              )
+
+    def print_exit(state):
+        print("*", hex(state.inspect.instruction), "->", hex(state.inspect.exit_target))
+        guard = state.inspect.exit_guard.__repr__()
+        if len(guard) > 150:
+            guard = guard[:150] + "..."
+        print("\t", state.inspect.exit_jumpkind, guard)
+
+    state.inspect.b("exit", when=angr.BP_AFTER, action=print_exit)
+    #state.inspect.b("instruction", when=angr.BP_BEFORE, action=print_addr)
+    #state.inspect.b("mem_write", when=angr.BP_AFTER, action=print_mem_write)
+    #state.inspect.b("reg_write", when=angr.BP_AFTER, action=print_reg_write)
+    #state.inspect.b("mem_read", when=angr.BP_AFTER, action=print_mem_read)
+    #state.inspect.b("reg_read", when=angr.BP_AFTER, action=print_reg_read)
+    #state.inspect.b("symbolic_variable", when=angr.BP_AFTER, action=print_symvar)
+    #state.inspect.b("address_concretization", when=angr.BP_AFTER, action=print_con)
+
+
+def exec_func(p: angr.Project, 
+              func: Function, 
+              non_term_funcs: List[int], 
+              verbose: bool = False) -> List[claripy.ast.bool.Bool]:
     """Symbolically executes a function and computes input constraints
 
     Args:
         p (angr.Project): Project for target binary
         func (Function): Function to run
+        non_term_funcs (List[int]): list of non-terminated function addresses
+        verbose (bool): debug printing
 
     Returns:
         List[claripy.ast.bool.Bool]: Constraints corresponding to control-flow paths through the function
@@ -276,79 +373,97 @@ def exec_func(p: angr.Project, func: Function) -> List[claripy.ast.bool.Bool]:
             # angr.options.LAZY_SOLVES, # TODO: Maybe helpful?
             angr.options.CACHELESS_SOLVER,
             angr.options.CALLLESS,
-            # angr.options.AVOID_MULTIVALUED_READS,
-            # angr.options.SYMBOLIC_WRITE_ADDRESSES,
-            # angr.options.CONSERVATIVE_READ_STRATEGY
+            angr.options.SYMBOLIC_INITIAL_VALUES,
+            angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY
         },
     )
-
-    # state.memory.write_strategies = [SymbolicOnlyConcretization()]
-    # state.memory.read_strategies = [SymbolicOnlyConcretization()]
-    # state.registers.write_strategies = [NoConcretizeSPGP()]
-    # state.registers.read_strategies = [NoConcretizeSPGP()]
 
     state = make_static_memory_symbolic(p, state, chunk_size=4)
 
     state = make_registers_symbolic(p, state, chunk_size=4)
 
-    def print_mem_write(state):
-        print(
-            "Write", state.inspect.mem_write_expr, "to", state.inspect.mem_write_address
-        )
+    # For debug printing
+    if verbose:
+        set_debug_inspect(state)
+    
+    # Create sym_mem as plugin so that it can be deep-copied when state forks
+    class SymMapPlugin(angr.SimStatePlugin):
+        def __init__(self, data=None):
+            super().__init__()
+            self.data = data or {}
 
-    def print_reg_write(state):
-        reg_offset = state.inspect.reg_write_offset  # Get the register offset
-        reg_name = state.arch.register_names.get(reg_offset, f"Unknown({reg_offset})")
-        print("Write", state.inspect.reg_write_expr, "to", reg_name)
+        def copy(self, memo):
+            return SymMapPlugin(copy.deepcopy(self.data))
 
-    def print_mem_read(state):
-        print("Read", state.inspect.mem_read_expr, "to", state.inspect.mem_read_address)
+    state.register_plugin('sym_mem', SymMapPlugin())
 
-    def print_reg_read(state):
-        reg_offset = state.inspect.reg_write_offset  # Get the register offset
-        reg_name = state.arch.register_names.get(reg_offset, f"Unknown({reg_offset})")
-        print("Write", state.inspect.reg_write_expr, "to", reg_name)
+    # Mapping 
+    def symmem_add(state):
+        state.get_plugin("sym_mem").data[state.inspect.symbolic_name] = []
 
-    def print_addr(state):
-        print(hex(state.inspect.instruction))
+    def symmem_set(state):
+        if len(state.inspect.mem_read_expr.args) == 2:
+            arg0_name = state.inspect.mem_read_expr.args[0]
+            if arg0_name in state.get_plugin("sym_mem").data:
+                state.get_plugin("sym_mem").data[arg0_name].append((hex(state.inspect.instruction), copy.deepcopy(state.inspect.mem_read_address)))
+                #if verbose:
+                #    print(f"  - SYM_MEM: {arg0_name} -> {state.inspect.mem_read_address}" )
 
-    # state.inspect.b("instruction", when=angr.BP_BEFORE, action=print_addr)
-    # state.inspect.b("mem_write", when=angr.BP_AFTER, action=print_mem_write)
-    # state.inspect.b("reg_write", when=angr.BP_AFTER, action=print_reg_write)
-    # state.inspect.b("mem_read", when=angr.BP_AFTER, action=print_mem_read)
-    # state.inspect.b("reg_read", when=angr.BP_AFTER, action=print_reg_read)
-    state.memory.unconstrained_use_addr = True
+    state.inspect.b("symbolic_variable", when=angr.BP_AFTER, action=symmem_add)
+    state.inspect.b("mem_read", when=angr.BP_AFTER, action=symmem_set)
+
+    #state.memory.unconstrained_use_addr = True
 
     sm = p.factory.simgr(state)
 
     regions = [(func.entry_point, ret) for ret in func.return_addrs]
+    if verbose:
+        print("Entry:", hex(func.entry_point))
+        print("Regions:", [f"({hex(a)}, {hex(b)})" for a,b in regions])
+        print()
+
     in_regions = lambda addr: any([e <= addr <= r for e, r in regions])
     cfg = p.analyses.CFGFast()
-    f = cfg.kb.functions.function(name=func.name)
-    if f is None:
-        print("Can't find function", func.name)
-        return set()
+    #f = cfg.kb.functions.function(name=func.name)
+    #if f is None:
+    #    print("Can't find function", func.name)
+    #    return set()
     sm.use_technique(angr.exploration_techniques.LoopSeer(cfg=cfg, bound=5))
+    # NonTermAvoid check and move states to avoid, must come first
+    sm.use_technique(NonTermAvoid(non_term_funcs))
     sm.use_technique(StashMonitor())
-    sm.use_technique(TIGSimplify())
+
+    # NOTE: replaced with OpBehaviorLzcount overwrite in memory_mixins
+    #sm.use_technique(TIGSimplify())
 
     sm.explore(
         find=func.return_addrs,
-        # avoid=(lambda s: not (in_regions(s.addr))), # change this eventually, we do want function calls but we want to step over them if possible
+        # change this eventually, we do want function calls but we want to step over them if possible
+        avoid=(lambda s: not (in_regions(s.addr))), 
         num_find=100,
     )
     # sm.step()
 
-    def dedup_constraints(constraint_list):
+    def dedup_constraints(constraint_sets):
         out = []
         seen = set()
-        for c in constraint_list:
+        for addr, c, sym_mem in constraint_sets:
             if str(c) not in seen:
                 seen.add(repr(c))
-                out.append(c)
+                new_sym_mem = {}
+                for sym, ptr in sym_mem.items():
+                    if not ptr:
+                        continue
+                    # TODO: I believe we only need to keep the last update
+                    #if len(ptr) > 1:
+                    #    raise NotImplementedError("More than one sym mem mapping. Check!")
+                    new_sym_mem[sym] = ptr[-1][1]
+                out.append((addr, c, new_sym_mem))
         return out
 
     for s in sm.active + sm.found:
         s.solver.simplify()
 
-    return dedup_constraints([s.solver.constraints for s in sm.found])
+    return dedup_constraints([(s.addr, 
+                               s.solver.constraints, 
+                               s.get_plugin("sym_mem").data ) for s in sm.found] )
