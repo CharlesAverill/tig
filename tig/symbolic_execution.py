@@ -388,18 +388,20 @@ def exec_func(p: angr.Project,
     
     # Create sym_mem as plugin so that it can be deep-copied when state forks
     class SymMapPlugin(angr.SimStatePlugin):
-        def __init__(self, data=None):
+        def __init__(self, data=None, exprs=None):
             super().__init__()
             self.data = data or {}
+            self.exprs = exprs or {}
 
         def copy(self, memo):
-            return SymMapPlugin(copy.deepcopy(self.data))
+            return SymMapPlugin(copy.deepcopy(self.data), copy.deepcopy(self.exprs))
 
     state.register_plugin('sym_mem', SymMapPlugin())
 
     # Mapping 
     def symmem_add(state):
         state.get_plugin("sym_mem").data[state.inspect.symbolic_name] = []
+        state.get_plugin("sym_mem").exprs[state.inspect.symbolic_name] = state.inspect.symbolic_expr
 
     def symmem_set(state):
         if len(state.inspect.mem_read_expr.args) == 2:
@@ -447,10 +449,11 @@ def exec_func(p: angr.Project,
     def dedup_constraints(constraint_sets):
         out = []
         seen = set()
-        for addr, c, sym_mem in constraint_sets:
+        for addr, c, sym_mem, exprs in constraint_sets:
             if str(c) not in seen:
                 seen.add(repr(c))
                 new_sym_mem = {}
+                new_exprs = {}
                 for sym, ptr in sym_mem.items():
                     if not ptr:
                         continue
@@ -458,7 +461,11 @@ def exec_func(p: angr.Project,
                     #if len(ptr) > 1:
                     #    raise NotImplementedError("More than one sym mem mapping. Check!")
                     new_sym_mem[sym] = ptr[-1][1]
-                out.append((addr, c, new_sym_mem))
+                for name,val in exprs.items():
+                    if not name:
+                        continue
+                    new_exprs[name] = val
+                out.append((addr, c, new_sym_mem, new_exprs))
         return out
 
     for s in sm.active + sm.found:
@@ -466,4 +473,5 @@ def exec_func(p: angr.Project,
 
     return dedup_constraints([(s.addr, 
                                s.solver.constraints, 
-                               s.get_plugin("sym_mem").data ) for s in sm.found] )
+                               s.get_plugin("sym_mem").data, 
+                               s.get_plugin("sym_mem").exprs ) for s in sm.found] )

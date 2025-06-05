@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import subprocess
+import claripy
 from typing import Tuple, Optional, Dict, List
 from tig.extract_basic_blocks import extract_bb, get_non_terminated_functions
 from tig.bininfo import Instruction, BasicBlock, Function
@@ -150,6 +151,101 @@ def time_of_basic_block(
         return f"{' + '.join(times + [parens(final_time)])}", None
 
 
+def claripy_var_to_rocq_var(arg: claripy.ast.Base) -> str:
+    if arg.symbolic:
+        name = next(iter(arg.variables))
+        if name.startswith("reg_"):
+            return name[name.index("_")+1:name.index("_", name.index("_")+1)]
+        elif name.startswith("mem_"):
+            addr = name[name.index("_")+1:name.index("_", name.index("_")+1)]
+            return f"mem Ⓓ[{addr}]"
+        elif name.startswith("CLZ_"):
+            return name[name.index("{")+1:name.index("}", name.index("{")+1)]
+        else:
+            raise NameError(f"Didn't recognize variable name '{name}'")
+    else:
+        if type(arg.args[0]) in [int, str]:
+            return str(arg.args[0])
+        print(type(arg.args[0]))
+    raise NotImplementedError(f"Didn't recognize structure of var '{arg}'")
+
+def claripy_bool_to_rocq_prop(ast) -> str:
+    if type(ast) in [bool, int, float, str]:
+        return str(ast)
+
+    try:
+        args = [claripy_bool_to_rocq_prop(arg) for arg in ast.args]
+    except AttributeError as e:
+        print(ast, e)
+        args = []
+
+    if ast.op == "__eq__":
+        return f"{args[0]} = {args[1]}"
+    elif ast.op == "Not":
+        return f"~ ({args[0]})"
+    elif ast.op == "__add__":
+        return f"({args[0]} ⊕ {args[1]})"
+    elif ast.op == "__mul__":
+        return f"({args[0]} ⊗ {args[1]})"
+    elif ast.op == "Extract":
+        return f"(xbits ({args[2]}) {args[1]} {args[0]})"
+    elif ast.op in ["BVV", "BVS"]:
+        return claripy_var_to_rocq_var(ast)
+    else:
+        print(ast)
+        raise NotImplementedError(f"Unsupported AST op '{ast.op}'")
+
+
+from collections import defaultdict, deque
+import claripy
+
+def extract_deps(ast, keys):
+    """
+    Extract which keys from `keys` are used symbolically in `ast`.
+    """
+    deps = set()
+    if ast.depth == 1:
+        return deps
+    for v in ast.variables:
+        if v in keys:
+            deps.add(v)
+    return deps
+
+def topological_sort_claripy(replacements):
+    """
+    Given a dict of claripy AST replacements, return a topologically sorted list
+    of (key, value) pairs such that replacements can be done in order.
+    """
+    keys = set(replacements.keys())
+    graph = defaultdict(set)
+    in_degree = defaultdict(int)
+
+    # Build dependency graph
+    for x, y_ast in replacements.items():
+        deps = extract_deps(y_ast, keys - {x})
+        for dep in deps:
+            graph[dep].add(x)
+            in_degree[x] += 1
+
+    # Nodes with no incoming edges
+    queue = deque(k for k in replacements if in_degree[k] == 0)
+    sorted_keys = []
+
+    while queue:
+        node = queue.popleft()
+        sorted_keys.append(node)
+        for neighbor in graph[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    if len(sorted_keys) != len(replacements):
+        raise ValueError("Cycle detected in replacements (mutual dependency)")
+
+    return [(k, replacements[k]) for k in sorted_keys]
+
+
+
 def generate_timing_invariants(bin_path: str, 
                                func: Function,
                                base_addr: int,
@@ -170,12 +266,31 @@ def generate_timing_invariants(bin_path: str,
     p = get_project(bin_path, base_addr)
     f = exec_func(p, func, no_term_func_addrs, verbose=True)
     with open("paths.txt", "w") as file:
-        for addr, c, sym_mem in f:
+        for addr, c, sym_mem, exprs in f:
             file.write(f"- {hex(addr)}\n")
             file.write(f"{c}\n")
             for sym,ptr in sym_mem.items():
                 file.write(f" - {sym}: {ptr}\n")
+            file.write("---")
+            for sym,val in exprs.items():
+                file.write(f" - {sym}: {val}\n")
             file.write("\n")
+    with open("postcondition.txt", "w") as file:
+        for addr, constraints, sym_mem, exprs in f:
+            subs = {}
+            for sym_name, sym_expr in exprs.items():
+                subs[sym_expr] = sym_mem[sym_name]
+            for c in constraints:
+                # for _ in range(len(subs)):
+                #     for k, v in subs.items():
+                #         c = claripy.replace(c, k, v)
+                rocq_prop = claripy_bool_to_rocq_prop(c)
+                if rocq_prop.startswith("gp = ") or rocq_prop.startswith("sp = "):
+                    continue
+                file.write(str(c) + " := " + rocq_prop + "\n")
+            file.write("\n")
+
+
     # for block in func:
     #     print(f"====={block.start_vaddr}=====")
     #     print(exec_bb(p, block, []))
