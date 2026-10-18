@@ -10,8 +10,9 @@ import sys
 import traceback
 
 from tig.bininfo import Function
-from tig.cloq import ARCHS, Formula, Unsupported, emit_riscv_proof
-from tig.loops import RISCV_GPRS, LoopFormula, emit_riscv_loop_proof, find_loops
+from tig.cloq import ARCHS, Formula, Unsupported, emit_proof
+from tig.loops import LoopFormula, emit_loop_proof, find_loops
+from tig.liveness import Liveness, ignore_vars_ltac
 from tig.extract_basic_blocks import extract_bb, get_non_terminated_functions
 from tig.symbolic_execution import exec_func, get_project
 
@@ -21,13 +22,14 @@ class _Done(Exception):
 
 
 def header_from(hand_proof: str):
-    """Reuse the hand-written proof's imports and binary binding."""
+    """Imports and program of a hand-written proof: its binary (RISC-V, ARM)
+    or lifted_prog (x86)."""
     src = open(hand_proof).read()
     head = src.split("Module TimingProof")[0].strip()
-    m = re.search(r"Definition binary := ([\w.]+)\.", src)
+    m = re.search(r"Definition (?:binary|lifted_prog) := ([\w.]+)\.", src)
     if m is not None:
         return head, m.group(1)
-    # the program is written out in the proof (Definition binary (a : addr) : N := match ...)
+    # program written out in the proof (Definition binary (a : addr) : N := ...)
     m = re.search(r"Definition binary\s*\(a : addr\) : N :=(.*?end)\.", src, re.S)
     if m is None:
         raise SystemExit(f"no `Definition binary` in {hand_proof}")
@@ -35,8 +37,8 @@ def header_from(hand_proof: str):
 
 
 def fill_empty_blocks(fdata, project):
-    """Ghidra's block script drops some instructions (e.g. x86 RET at the end
-    of a block); disassemble whatever part of each block it left uncovered."""
+    """Disassemble the parts of blocks that Ghidra's block script leaves out
+    (such as x86 RET at the end of a block)."""
     import capstone
     arch = project.arch
     for b in fdata["blocks"]:
@@ -57,8 +59,7 @@ def fill_empty_blocks(fdata, project):
 
 
 def hook_zbb(project, func):
-    """pypcode's RISC-V SLEIGH spec lacks the Zbb logic-with-negate
-    instructions; emulate them with angr hooks."""
+    """Emulate Zbb andn/orn/xnor, which pypcode's RISC-V spec lacks."""
     ops = {"andn": lambda a, b: a & ~b, "orn": lambda a, b: a | ~b, "xnor": lambda a, b: ~(a ^ b)}
     for b in func.blocks:
         for i in b.instructions:
@@ -103,8 +104,6 @@ def main():
         fdata = [x for x in data if x["function_name"] == args.func]
         if not fdata:
             raise Unsupported(f"function {args.func} not found by Ghidra")
-        # Ghidra's block script leaves some blocks (x86 RET blocks) without
-        # instructions; disassemble those with angr.
         with open(args.bin, "rb") as fh:
             is_pie = fh.read(18)[16] == 3  # e_type == ET_DYN
         p = get_project(args.bin, 0x100000 if is_pie else None, arch.lang)
@@ -123,39 +122,42 @@ def main():
                                   else arch.instr_time(i, ("?",)))
                     times[rel + "_asm"] = i.instr_str
             json.dump(times, open(args.dump_times, "w"), indent=1)
-        # (p loads at Ghidra's addresses: Ghidra rebases position-independent
-        # ELFs to 0x100000; other ELFs keep their link addresses.)
+        # Ghidra rebases position-independent ELFs to 0x100000
         loops = find_loops(func)
         if loops:
-            if args.arch != "riscv":
-                raise Unsupported("loop invariants are only implemented for RISC-V")
             if len(loops) > 1:
                 raise Unsupported(f"{len(loops)} loops (only single, non-nested loops get invariants)")
             (h, body), = loops.items()
-            # Branch targets outside the function that are not calls end the function too.
+            # jumps out of the function also end it
             extra = sorted({x for b in func.blocks for x in b.exit_vaddrs if x not in func.block_dict}
                            | {b.instructions[-1].offset + b.instructions[-1].size for b in func.blocks
                               if arch.is_branch(b.instructions[-1])
                               and b.instructions[-1].offset + b.instructions[-1].size not in func.block_dict})
             res = exec_func(p, func, no_term, state_args=arch.state_args, loop_bound=args.loop_bound,
-                            snapshots=({h}, RISCV_GPRS), extra_exits=extra,
+                            snapshots=({h}, arch.gprs), extra_exits=extra,
                             lazy_solves=args.lazy_solves)
             lf = LoopFormula(arch, func, res, h, body, extra).build()
             record.update(header=hex(h), count=lf.count, relation=lf.rel,
                           paths=len(lf.paths), assumptions=lf.assumptions)
             head, binary = header_from(args.header_from)
-            open(args.out, "w").write(emit_riscv_loop_proof(func, lf, head, binary))
-            record.update(status="generated", exits=[hex(e) for e in sorted(lf.posts)])
+            ignored = Liveness(arch, p, func, lf.count_branches).ignorable(
+                {h: {arch.reg(r) for r in lf.header_regs}})
+            record["ignored"] = ignored
+            open(args.out, "w").write(emit_loop_proof(arch, func, lf, head, binary,
+                                                      ignore_vars_ltac(arch, ignored)))
+            record.update(status="generated", exits=[hex(e) for e in sorted(lf.posts)],
+                          admitted=[hex(e) for e in sorted(set(lf.admitted))])
             raise _Done
         res = exec_func(p, func, no_term, state_args=arch.state_args)
         f = Formula(arch, func, res)
         record["paths"] = len(f.traces)
         formula = f.build()
         exits = sorted({func.get_block(t[-1]).instructions[-1].offset for t in f.traces})
-        if args.arch != "riscv":
-            raise Unsupported(f"postcondition generated, but proof emission is only implemented for RISC-V: {formula}")
         head, binary = header_from(args.header_from)
-        proof = emit_riscv_proof(func, formula, f.printer, exits, head, binary)
+        ignored = Liveness(arch, p, func).ignorable()
+        record["ignored"] = ignored
+        proof = emit_proof(arch, func, formula, f.printer, exits, head, binary,
+                           ignore_vars_ltac(arch, ignored))
         open(args.out, "w").write(proof)
         record.update(status="generated", exits=[hex(e) for e in exits])
     except _Done:

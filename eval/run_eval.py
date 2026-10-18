@@ -61,7 +61,7 @@ def main():
             continue
         rec = {"id": e["id"], "arch": e.get("arch", "riscv")}
         # 2. Cloq backend
-        gen = os.path.join(rocq_dir, "tig_out", "tig_" + e["id"] + ".v")  # (prefix: ids can name lifted libraries)
+        gen = os.path.join(rocq_dir, "tig_out", "tig_" + e["id"] + ".v")  # prefix avoids clashes with lifted files
         rc, log, dt = sh([PY, "-m", "tig.cloq_main", e["elf"], e["func"], "--arch", rec["arch"],
                           "--header-from", e["hand"], "--out", gen] + e.get("extra", []), TIG, 900)
         try:
@@ -70,7 +70,7 @@ def main():
             rec["generate"] = {"status": "crash" if "MemoryError" not in log else "out-of-memory (3 GB cap)",
                                "detail": log[-300:]}
         rec["generate"]["secs"] = round(dt)
-        # 1. legacy TIG (after generation, which caches Ghidra's block JSON) (RISC-V only; it hard-codes the RISC-V language)
+        # 1. legacy TIG, RISC-V only (runs after generation, which caches Ghidra's output)
         if rec["arch"] == "riscv":
             rc, log, dt = sh([PY, "-m", "tig.tig", e["elf"], e["func"]], ORIG, 600)
             err = [l for l in log.splitlines() if "Error" in l or "Exception" in l]
@@ -82,9 +82,8 @@ def main():
             rc, log, dt = sh(env_rocq + [os.path.relpath(gen, rocq_dir)], rocq_dir, cfg["timeout"])
             rec["standalone"] = {"rc": rc, "secs": round(dt), "err": rocq_error(log) if rc else ""}
             # 4. substituted into the hand proof
-            # A hand loop proof's internal invariants are tuned to its own
-            # postcondition, so substituting TIG's loop postcondition into it
-            # is not meaningful; loop proofs are judged standalone.
+            # A hand loop proof's invariants fit its own postcondition, so loop
+            # proofs are only checked standalone.
             if not e.get("skip_substitute") and "header" not in rec["generate"]:
                 sub = os.path.join(rocq_dir, "tig_sub", e["id"] + ".v")
                 rc, log, _ = sh([PY, "eval/substitute.py", e["hand"], gen, sub], TIG, 60)

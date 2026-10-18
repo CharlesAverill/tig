@@ -13,6 +13,35 @@ logging.getLogger("cle").setLevel(logging.ERROR)
 import tig.memory_mixins
 
 
+def native_arm_loops(bin_path: str, entry: int):
+    """(cfg, loops) of the function at entry, using angr's native ARM arch,
+    since angr's CFG recovery does not support pcode ARM. Native Thumb
+    addresses have the low bit set, so the loops are moved to pcode's even
+    addresses."""
+    from angr.analyses.loopfinder import Loop
+    from angr.codenode import BlockNode
+    native = angr.Project(bin_path, load_options={'auto_load_libs': False})
+    cfg = native.analyses.CFGFast(normalize=True)
+    nfunc = cfg.kb.functions.function(addr=entry | 1) or cfg.kb.functions.function(addr=entry)
+    if nfunc is None:
+        return cfg, []
+    nodes = {}
+
+    def node(n):
+        if n.addr not in nodes:
+            nodes[n.addr] = BlockNode(n.addr & ~1, n.size)
+        return nodes[n.addr]
+
+    def edges(es):
+        return [(node(a), node(b)) for a, b in es]
+
+    def move(l):
+        return Loop(node(l.entry), edges(l.entry_edges), edges(l.break_edges),
+                    edges(l.continue_edges), [node(n) for n in l.body_nodes],
+                    l.graph, [move(sub) for sub in l.subloops])
+    finder = native.analyses.LoopFinder(kb=cfg.kb, normalize=True, functions=[nfunc])
+    return cfg, [move(l) for l in finder.loops]
+
 
 def get_project(bin_path: str, 
                 base_addr: int,
@@ -319,16 +348,15 @@ def hook_symmem(state: angr.SimState, func: Function, verbose: bool = False,
                 print("\n->", hex(instr_addr), "??")
         if instr_addr in func.block_dict:
             state.get_plugin("sym_mem").bbl_history.append(instr_addr)
-        # Cloq backend: capture the pre-instruction values of the registers that
-        # this instruction's timing depends on (e.g. RISC-V sll/clz read rd).
+        # Cloq backend: values of the registers this instruction's time depends
+        # on (RISC-V sll/clz read rd)
         if state_args is not None and instr is not None:
             regs = state_args(instr)
             if regs:
                 key = (tuple(state.get_plugin("sym_mem").bbl_history), instr_addr)
                 vals = tuple(state.registers.load(r, inspect=False, disable_actions=True) for r in regs)
                 state.globals["tig_state_args"] = {**state.globals.get("tig_state_args", {}), key: vals}
-        # Cloq backend: snapshot the general-purpose registers at loop headers,
-        # once per visit, to recover induction variables and loop-invariant values.
+        # Cloq backend: registers at each loop header visit, for loop invariants
         if snapshots and instr_addr in snapshots[0]:
             key = tuple(state.get_plugin("sym_mem").bbl_history)
             vals = {r: state.registers.load(r, inspect=False, disable_actions=True) for r in snapshots[1]}
@@ -395,7 +423,7 @@ def exec_func(p: angr.Project,
     )
 
     if lazy_solves:
-        # skip per-branch feasibility checks (Z3 can stall on symbolic-index loads)
+        # skip branch feasibility checks (Z3 can stall on symbolic-index loads)
         state.options.add(angr.options.LAZY_SOLVES)
     make_static_memory_symbolic(p, state, chunk_size=4)
 
@@ -412,18 +440,17 @@ def exec_func(p: angr.Project,
         print("Regions:", [f"({hex(a)}, {hex(b)})" for a,b in regions])
         print()
 
-    # A path stays inside the function iff it is in one of the function's
-    # blocks.  (Comparing against [entry, return] wrongly discards blocks the
-    # compiler places after the return instruction, e.g. outlined branches.)
+    # A path is inside the function if it is in one of its blocks. Checking
+    # [entry, return] would drop blocks placed after the return.
     block_ranges = [(b.start_vaddr, b.start_vaddr + b.size) for b in func.blocks]
     in_regions = lambda addr: any(lo <= addr < hi for lo, hi in block_ranges)
-    try:
+    if archinfo.arch_arm.is_arm_arch(p.arch) and isinstance(p.arch, archinfo.ArchPcode):
+        cfg, loops = native_arm_loops(p.filename, func.entry_point)
+        if loops:
+            sm.use_technique(angr.exploration_techniques.LoopSeer(cfg=cfg, loops=loops, bound=loop_bound))
+    else:
         cfg = p.analyses.CFGFast()
         sm.use_technique(angr.exploration_techniques.LoopSeer(cfg=cfg, bound=loop_bound))
-    except AttributeError:
-        # angr's CFG recovery assumes its native ARM arch; for pcode ARM bound
-        # paths by length instead (loops are still unrolled, then reported).
-        sm.use_technique(angr.exploration_techniques.LengthLimiter(max_length=4 * loop_bound))
     # NonTermAvoid check and move states to avoid, must come first
     sm.use_technique(NonTermAvoid(non_term_funcs, verbose=verbose))
     sm.use_technique(StashMonitor(verbose=verbose))

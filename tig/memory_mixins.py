@@ -215,7 +215,7 @@ class SymMemPlugin(SimStatePlugin):
 
     def record_register_write(self, reg_name: str, symbolic_value: BV, verbose=False):
         if not hasattr(symbolic_value, "depth"):
-            return  # concrete write (e.g. pcode context registers on ARM)
+            return  # concrete write (pcode context registers on ARM)
         if symbolic_value.depth == 1 and len(symbolic_value.variables) == 1:
             symbolic_name = list(symbolic_value.variables)[0]
             if symbolic_name.startswith("CLZ"):
@@ -224,7 +224,7 @@ class SymMemPlugin(SimStatePlugin):
             if symbolic_name not in self.symbolic_references:
                 old_name = symbolic_name.rsplit("_", 2)[0]
                 if old_name not in self.symbolic_references:
-                    return  # an initial register copied before anything referenced it
+                    return  # initial register copied before it was referenced
                 self.symbolic_references[symbolic_name] = self.symbolic_references[old_name]
                 if verbose:
                     print(f"  +++++ register write: {reg_name} = {symbolic_value} <- {old_name}")
@@ -245,8 +245,8 @@ class SymMemPlugin(SimStatePlugin):
     def get_repr(self, entry: BV)-> str:
         if isinstance(entry, int):
             return hex(entry)  # concrete address
-        # The legacy printer only knows a few operators; the Cloq backend prints
-        # from the ASTs instead, so never abort symbolic execution here.
+        # The legacy printer handles few operators. The Cloq backend prints
+        # from the ASTs, so do not abort symbolic execution here.
         try:
             value, negate = self._get_repr(entry)
         except (NotImplementedError, KeyError, ValueError, AttributeError):

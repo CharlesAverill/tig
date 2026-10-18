@@ -182,8 +182,8 @@ def extract_bb(
     remove_empty = lambda l: [x for x in l if len(x)]
 
     if not use_objdump:
-        # Keep Ghidra's own disassembly (used for ISAs whose objdump syntax the
-        # parser below does not understand, e.g. Thumb `#imm` and x86).
+        # Keep Ghidra's disassembly, for ISAs whose objdump syntax the parser
+        # below does not handle (Thumb #imm, x86).
         for func_data in bb:
             for block in func_data["blocks"]:
                 for instr in block["instructions"]:
@@ -255,7 +255,7 @@ def get_non_terminated_functions(bb_data: List) -> List[Tuple[str,int]]:
     no_terms = []
     for function in bb_data:
         if not function["blocks"]:
-            continue  # e.g. imported functions with no code in the binary
+            continue  # imported function
         has_exit = False
         for block in function["blocks"]:
             if block["is_exit_point"]:

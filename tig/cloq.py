@@ -1,17 +1,10 @@
-"""Cloq backend: emit timing postconditions and proofs for the current Cloq API.
+"""Cloq backend: timing postconditions and proofs for the current Cloq API.
 
 The legacy synthesizer (tig.proof_synthesis) targets an older Picinae timing
-API with hard-coded NEORV32 cycle counts.  This backend instead
-
-  * names instruction times after the CPUTimingBehavior parameters that Cloq's
-    timing modules use (taddi, ttbne, tldr_imm, ...), so proofs stay CPU-agnostic;
-  * prints branch conditions and state-dependent timing arguments directly from
-    angr's ASTs as Rocq terms over the function's inputs (initial registers and
-    memory), using Picinae's modular-arithmetic notation;
-  * distinguishes taken from not-taken branches by comparing the successor with
-    the branch's fall-through address;
-  * emits a complete proof file (entry/exit invariants plus a generic
-    `repeat step; hammer` script) that can be checked by Rocq.
+API with hard-coded NEORV32 cycle counts. This backend names instruction times
+after Cloq's CPUTimingBehavior parameters (taddi, ttbne, tldr_imm, ...), prints
+branch conditions as Rocq terms over the function's inputs, and emits a
+complete proof file.
 """
 import re
 from typing import Dict, List, Optional, Tuple
@@ -25,9 +18,7 @@ class Unsupported(Exception):
     """Raised for programs or expressions the backend cannot express."""
 
 
-# --------------------------------------------------------------------------
 # Architecture descriptions
-# --------------------------------------------------------------------------
 
 def _riscv_imm(op: str) -> int:
     return int(op, 0)
@@ -39,14 +30,33 @@ class RISCV:
     width = 32
     mem_var = "V_MEM32"
     branch_mnems = {"beq", "bne", "blt", "bge", "bltu", "bgeu"}
-    # Instructions whose Cloq time depends on a register's pre-instruction
-    # value (RISCVTiming.v: R5_Sll rd _ _ => tsll (regvalue s rd), etc.).
+    # Instructions whose time depends on a register's value before the
+    # instruction (RISCVTiming.v: R5_Sll rd _ _ => tsll (regvalue s rd)).
     state_dep = {"sll": "tsll", "srl": "tsrl", "sra": "tsra", "clz": "tclz"}
     simple = {m: "t" + m for m in
               "add addi slt slti sltu sltiu xor xori or ori and andi sub lui auipc "
               "jal jalr lb lh lw lbu lhu sb sh sw mul mulh mulhu div divu rem remu "
               "andn csrrw csrrs csrrc csrrwi csrrsi csrrci".split()}
     simple.update({"mulhsu": "tmulhsu", "fence": "tfence", "fence.i": "tfence"})
+    gprs = ("ra sp gp tp t0 t1 t2 s0 s1 a0 a1 a2 a3 a4 a5 a6 a7 "
+            "s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 t3 t4 t5 t6").split()
+    proof = dict(behavior="RVCPUTimingBehavior", timing="RISCVTiming", auto="RISCVTimingAutomation",
+                 step="r5_step", typctx="rvtypctx", welltyped="lift_riscv_welltyped", isa="Picinae_riscv.ISA_RISCV",
+                 program="binary", relative=False)
+
+    def canon(self, op: str):
+        """Register name, immediate value, or None."""
+        if op == "zero":
+            return 0
+        return op if op in self.gprs else None
+
+    def operand_regs(self, instr: Instruction) -> List[str]:
+        return [r for op in instr.operands for r in re.findall(r"[a-z][a-z0-9]*", op) if r in self.gprs]
+
+    def exit_compare(self, block) -> list:
+        """Operands compared by the branch that ends `block`."""
+        last = block.instructions[-1]
+        return [self.canon(o) for o in last.operands[:2]] if self.is_branch(last) else []
 
     @staticmethod
     def reg(name: str) -> str:
@@ -66,7 +76,7 @@ class RISCV:
             return f"t{m} {_riscv_imm(instr.operands[2])}"
         if m in self.simple:
             return self.simple[m]
-        return "time_inf"  # decodes to an instruction Cloq does not time
+        return "time_inf"  # not timed by Cloq
 
     def is_branch(self, instr: Instruction) -> bool:
         return instr.mnem in self.branch_mnems
@@ -110,6 +120,31 @@ class ARMv6M:
     mem_var = "V_MEM32"
     conds = "eq ne cs cc hs lo mi pl vs vc hi ls ge lt gt le".split()
     branch_mnems = {"b" + c for c in conds}
+    gprs = "r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 r10 r11 r12 sp lr".split()
+    proof = dict(behavior="ARMv6MCPUTimingBehavior", timing="ARMv6MTiming", auto="ARMv6MTimingAutomation",
+                 step="armv6m_step", typctx="armv6mtypctx", welltyped="welltyped_lift_armv6m", isa="Picinae_armv6m.ISA_ARMv6M",
+                 program="binary", relative=False)
+
+    def canon(self, op: str):
+        op = op.lower().strip()
+        if op in self.gprs:
+            return op
+        if op.startswith("#"):
+            return int(op[1:], 0)
+        return None
+
+    def operand_regs(self, instr: Instruction) -> List[str]:
+        return [r for op in _ghidra_ops(instr) for r in re.findall(r"\b(r\d+|sp|lr)\b", op.lower())
+                if r in self.gprs]
+
+    def exit_compare(self, block) -> list:
+        """Operands of the cmp that sets the flags for the block's branch."""
+        if not self.is_branch(block.instructions[-1]):
+            return []
+        for ins in reversed(block.instructions[:-1]):
+            if self._norm(ins.mnem) in ("cmp", "cmn"):
+                return [self.canon(o) for o in _ghidra_ops(ins)[:2]]
+        return []
 
     @staticmethod
     def reg(name: str) -> str:
@@ -143,8 +178,8 @@ class ARMv6M:
             return f"({base} + {len(reglist(','.join(ops[1:])))})"
         if m in ("ldr", "ldrb", "ldrh", "ldrsb", "ldrsh", "str", "strb", "strh"):
             mem = ",".join(ops[1:])
-            # Ghidra prints PC-relative literal loads with the resolved address
-            # (`ldr r0,[0x08000028]`), i.e. without a base register.
+            # Ghidra prints PC-relative loads with the resolved address
+            # (ldr r0,[0x08000028]), without a base register.
             if m == "ldr" and ("pc" in mem or not mem.startswith("[") or re.fullmatch(r"\[0x[0-9a-f]+\]", mem)):
                 return "tldr_pc"
             if mem.startswith("[sp") and m in ("ldr", "str"):
@@ -190,7 +225,7 @@ class ARMv6M:
 
 
 class AMD64:
-    """x86-64.  Cloq's x86 proofs time each address with an operand-form name
+    """x86-64. Cloq's x86 proofs time each address with an operand-form name
     (mov_r64_m64, cmp_r64_i, jz_addr, ...) from amd64CPUTimingBehavior."""
     name = "amd64"
     lang = "x86:LE:64:default"
@@ -201,15 +236,49 @@ class AMD64:
                     "jge", "jnge", "jle", "jnle", "jg", "jng"}
     _ptr = {"byte": 8, "word": 16, "dword": 32, "qword": 64, "xmmword": 128}
 
+    gprs = "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15".split()
+    proof = dict(behavior="amd64CPUTimingBehavior", timing="AMD64Timing", auto="AMD64TimingAutomation",
+                 step="x64_step", typctx="x64typctx", welltyped="welltyped", isa="Picinae_amd64.ISA_amd64",
+                 program="lifted", relative=True)
+
     def __init__(self):
-        w = {}
+        w, parent = {}, {}
         for r in "rax rbx rcx rdx rsi rdi rbp rsp rip".split():
             w[r], w["e" + r[1:]], w[r[1:]] = 64, 32, 16
-        for r in "al bl cl dl sil dil bpl spl ah bh ch dh".split():
-            w[r] = 8
+            parent[r] = parent["e" + r[1:]] = parent[r[1:]] = r
+        for r, p in zip("al bl cl dl sil dil bpl spl ah bh ch dh".split(),
+                        "rax rbx rcx rdx rsi rdi rbp rsp rax rbx rcx rdx".split()):
+            w[r], parent[r] = 8, p
         for i in range(8, 16):
             w[f"r{i}"], w[f"r{i}d"], w[f"r{i}w"], w[f"r{i}b"] = 64, 32, 16, 8
-        self._w = w
+            for suf in ("", "d", "w", "b"):
+                parent[f"r{i}{suf}"] = f"r{i}"
+        self._w, self._parent = w, parent
+
+    def canon(self, op: str):
+        """64-bit register name, immediate value, or None."""
+        op = op.lower().strip()
+        if op in self._parent:
+            return self._parent[op]
+        try:
+            return int(op, 0)
+        except ValueError:
+            return None
+
+    def operand_regs(self, instr: Instruction) -> List[str]:
+        return [self._parent[r] for op in _ghidra_ops(instr)
+                for r in re.findall(r"[a-z][a-z0-9]*", op.lower()) if r in self._parent]
+
+    def exit_compare(self, block) -> list:
+        if not self.is_branch(block.instructions[-1]):
+            return []
+        for ins in reversed(block.instructions[:-1]):
+            m, ops = ins.mnem.lower(), _ghidra_ops(ins)
+            if m == "cmp":
+                return [self.canon(o) for o in ops[:2]]
+            if m == "test" and len(ops) == 2 and ops[0].lower() == ops[1].lower():
+                return [self.canon(ops[0]), 0]
+        return []
 
     @staticmethod
     def reg(name: str) -> str:
@@ -241,9 +310,9 @@ class AMD64:
                 kinds.append("i")
         return kinds
 
-    # Names that amd64CPUTimingBehavior declares (set from the model file when
-    # available); a name the model lacks falls back to the reversed operand
-    # order, which the model uses for both directions (cmp m64,r64 -> cmp_r64_m64).
+    # Names declared by amd64CPUTimingBehavior, if the model file is given.
+    # A missing name falls back to the reversed operand order, which the model
+    # uses for both directions (cmp m64,r64 -> cmp_r64_m64).
     model_names: set = set()
 
     @classmethod
@@ -265,7 +334,7 @@ class AMD64:
 
     def branch_times(self, instr: Instruction) -> Tuple[str, str]:
         t = self.instr_time(instr, ())
-        return t, t  # Cloq's x86 timing does not distinguish taken branches
+        return t, t  # same time taken or not
 
     def is_return(self, instr: Instruction) -> bool:
         return instr.mnem.lower() == "ret"
@@ -274,9 +343,13 @@ class AMD64:
 ARCHS = {"riscv": RISCV(), "armv6m": ARMv6M(), "amd64": AMD64()}
 
 
-# --------------------------------------------------------------------------
 # Expression printing
-# --------------------------------------------------------------------------
+
+def _reg_name(sym: str) -> str:
+    """Register of an initial-register symbol reg_<name>_<id>_<bits>, which
+    may have more _<id>_<bits> suffixes (x86 sub-registers)."""
+    return re.sub(r"(_\d+_\d+)+$", "", sym[len("reg_"):]).lower()
+
 
 class Printer:
     """Prints claripy ASTs as Rocq terms over the function's inputs."""
@@ -287,7 +360,6 @@ class Printer:
         self.regs = set()       # initial registers referenced
         self.uses_mem = False   # initial memory referenced
 
-    # -- leaves ------------------------------------------------------------
     def _getmem(self, addr: str, nbytes: int) -> str:
         self.uses_mem = True
         sym = {1: "Ⓑ", 2: "Ⓦ", 4: "Ⓓ", 8: "Ⓠ"}.get(nbytes)
@@ -296,15 +368,14 @@ class Printer:
         return f"mem {sym}[{addr}]"
 
     def addr(self, e) -> str:
-        """Print a load/store address the way Picinae's lifter leaves it:
-        getmem reduces addresses modulo 2^w itself, so offsets stay unreduced
-        (`16 + a0`), and negative offsets use modular subtraction (`gp ⊖ 1900`)."""
+        """Print an address the way Picinae's lifter leaves it. getmem reduces
+        addresses mod 2^w, so offsets stay unreduced (16 + a0) and negative
+        offsets use modular subtraction (gp ⊖ 1900)."""
         if isinstance(e, int):
             return str(e)  # concrete address
         w = e.size()
         if e.op == "__add__":
-            # getmem reduces the address mod 2^w, so nested sums flatten into
-            # Picinae's left-associated form (92 + a0 + a1).
+            # flatten nested sums into Picinae's form (92 + a0 + a1)
             def flat(x):
                 return [y for a in x.args for y in flat(a)] if x.op == "__add__" else [x]
             terms = flat(e)
@@ -322,11 +393,9 @@ class Printer:
         return self.bv(e)
 
     def _leaf_load(self, name: str) -> Optional[Tuple[str, int]]:
-        """(address term, length) if `name` is the value of a load from the
-        initial memory, else None."""
-        # TIG's extension override (tig.memory_mixins) replaces an extended
-        # load `v` with a wider variable named `v_<id>_<bits>`; it denotes the
-        # same (zero-extended) value.
+        """(address, length) if `name` is a load from the initial memory."""
+        # tig.memory_mixins renames an extended load v to v_<id>_<bits>,
+        # with the same (zero-extended) value.
         while name not in self.mem_reads and re.search(r"_\d+_\d+$", name):
             base = name.rsplit("_", 2)[0]
             if base in self.mem_reads or re.match(r"(?:data|bss)_init_", base):
@@ -344,9 +413,15 @@ class Printer:
     def _bvs(self, e) -> str:
         name = e.args[0]
         if name.startswith("reg_"):
-            reg = name[len("reg_"):].rsplit("_", 2)[0].lower()
-            self.regs.add(reg)
-            return reg
+            reg = _reg_name(name)
+            parent = getattr(self.arch, "_parent", {}).get(reg, reg)
+            self.regs.add(parent)
+            if parent == reg:
+                return reg
+            # x86 sub-register
+            if reg in ("ah", "bh", "ch", "dh"):
+                return f"(xbits {parent} 8 16)"
+            return f"({parent} mod 2^{self.arch._w[reg]})"
         if name.startswith("CLZ_{"):
             inner = re.match(r"CLZ_\{(.+)\}", name).group(1)
             return f"(clz ({self._name(inner)}) {self.arch.width})"
@@ -357,7 +432,7 @@ class Printer:
 
     def _name(self, name: str) -> str:
         if name.startswith("reg_"):
-            reg = name[len("reg_"):].rsplit("_", 2)[0].lower()
+            reg = _reg_name(name)
             self.regs.add(reg)
             return reg
         load = self._leaf_load(name)
@@ -365,7 +440,6 @@ class Printer:
             raise Unsupported(f"unknown symbolic value {name}")
         return self._getmem(load[0], load[1])
 
-    # -- bit-vectors -------------------------------------------------------
     def bv(self, e) -> str:
         if isinstance(e, int):
             return str(e)
@@ -377,7 +451,7 @@ class Printer:
         if op == "BVS":
             return self._bvs(e)
         if op == "__add__":
-            # Picinae's normal form: x ⊖ k for a negative constant offset.
+            # Picinae writes negative offsets as x ⊖ k
             consts = [x.args[0] for x in a if x.op == "BVV"]
             others = [x for x in a if x.op != "BVV"]
             c = sum(consts) % (1 << w)
@@ -417,7 +491,7 @@ class Printer:
             return f"(ofZ {w} (toZ {w0} {self.bv(a[1])}))"
         if op == "Extract":
             hi, lo, x = a
-            # Byte-aligned slices of a load are narrower loads (little-endian).
+            # byte-aligned slices of a load are narrower loads (little-endian)
             if x.op == "BVS" and lo % 8 == 0 and (hi + 1) % 8 == 0:
                 load = self._leaf_load(x.args[0])
                 if load is not None:
@@ -438,7 +512,6 @@ class Printer:
             return f"(if {self.bool(a[0])} then {self.bv(a[1])} else {self.bv(a[2])})"
         raise Unsupported(f"bit-vector operator {op}")
 
-    # -- booleans ----------------------------------------------------------
     def bool(self, e) -> str:
         op = e.op
         a = e.args
@@ -471,9 +544,7 @@ class Printer:
         raise Unsupported(f"boolean operator {op}")
 
 
-# --------------------------------------------------------------------------
 # Postcondition from symbolic traces
-# --------------------------------------------------------------------------
 
 class Formula:
     def __init__(self, arch, func: Function, result: Dict):
@@ -491,10 +562,10 @@ class Formula:
         self.has_loop = any(len(set(t)) != len(t) for t in self.traces) or self._cfg_has_cycle()
 
     def _cfg_has_cycle(self) -> bool:
-        """A back edge in the function's CFG (depth-first search).  Paths alone
-        can miss loops whose iterations angr did not explore."""
-        # Ghidra's exit lists omit some edges (self-loops, jumps); its source
-        # lists have them, so take the union of both directions.
+        """Whether the function's CFG has a back edge. Explored paths alone can
+        miss loops."""
+        # Ghidra's exit lists miss some edges (self-loops, jumps) that its
+        # source lists have, so use both.
         succ = {b.start_vaddr: {x for x in b.exit_vaddrs if x in self.func.block_dict}
                 for b in self.func.blocks}
         for b in self.func.blocks:
@@ -535,7 +606,7 @@ class Formula:
         block = self.func.get_block(prefix[-1])
         if block is None:
             raise Unsupported(f"path leaves the function at {prefix[-1]:#x}")
-        bprefix = prefix  # bbl history including this block
+        bprefix = prefix
         times = [self._time(i, bprefix) for i in block.instructions[:-1]]
         last = block.instructions[-1]
         succs = sorted({t[len(prefix)] for t in self.traces
@@ -569,13 +640,66 @@ class Formula:
         return "(" + " + ".join(times) + f" + {self._node(prefix + (succs[0],))})"
 
 
-# --------------------------------------------------------------------------
 # Proof file
-# --------------------------------------------------------------------------
 
-def emit_riscv_proof(func: Function, formula: str, printer: Printer, exits: List[int],
-                     header: str, binary: str) -> str:
-    name = func.name
+def loc(arch, func: Function):
+    """Address as numbered in the Rocq program. x86 lifted programs start at
+    0 at the function's entry."""
+    base = func.entry_point if arch.proof["relative"] else 0
+    return lambda a: a - base
+
+
+def proof_preamble(arch, func: Function, exits: List[int], header: str, binary: str) -> str:
+    """Proof file header, through the timing modules."""
+    P, at, name = arch.proof, loc(arch, func), func.name
+    ex = " | ".join(f"{at(e):#x}" for e in exits)
+    if P["program"] == "binary":
+        prog = f"    Definition binary := {binary}."
+    else:
+        rows = []
+        for b in sorted(func.blocks, key=lambda b: b.start_vaddr):
+            for i in b.instructions:
+                t = arch.branch_times(i)[0] if arch.is_branch(i) else arch.instr_time(i, ())
+                rows.append(f"        (* {i.instr_str} *)\n        | {at(i.offset):#x} => {t}")
+        prog = ("    Definition time_of_addr (s : store) (a : addr) : N :=\n        match a with\n"
+                + "\n".join(rows) + "\n        | _ => time_inf\n        end.\n\n"
+                + f"    Definition lifted_prog := {binary}.")
+    return f"""{header}
+
+Module TimingProof (cpu : {P["behavior"]}).
+Import cpu.
+
+Module Program_{name} <: ProgramInformation.
+    Definition entry_addr : N := {at(func.entry_point):#x}.
+
+    Definition exits (t:trace) : bool :=
+        match t with (Addr a,_)::_ => match a with
+        | {ex} => true
+        | _ => false
+    end | _ => false end.
+
+{prog}
+End Program_{name}.
+
+Module {P["timing"]} := {P["timing"]} cpu Program_{name}.
+Module {name}Auto := {P["auto"]} {P["timing"]}.
+Import Program_{name} {name}Auto."""
+
+
+def proof_setup(arch) -> str:
+    """Inductive-step setup."""
+    P = arch.proof
+    return f"""    eapply startof_prefix in ENTRY; try eassumption.
+    eapply preservation_exec_prog in MDL;
+        try eassumption; [idtac|apply {P["welltyped"]}].
+    clear - ENTRY PRE MDL. rename t1 into t. rename s1 into s'.
+
+    destruct_inv {arch.width} PRE."""
+
+
+def emit_proof(arch, func: Function, formula: str, printer: Printer, exits: List[int],
+               header: str, binary: str, ignore: str = "") -> str:
+    name, P, at = func.name, arch.proof, loc(arch, func)
     params = (["mem"] if printer.uses_mem else []) + sorted(printer.regs)
     binders = ""
     if printer.uses_mem:
@@ -584,33 +708,15 @@ def emit_riscv_proof(func: Function, formula: str, printer: Printer, exits: List
     if regs:
         binders += " (" + " ".join(regs) + " : N)"
     args = " ".join(params)
-    eqs = (["s V_MEM32 = mem"] if printer.uses_mem else []) + [f"s {RISCV.reg(r)} = {r}" for r in regs]
+    eqs = ([f"s {arch.mem_var} = mem"] if printer.uses_mem else []) + [f"s {arch.reg(r)} = {r}" for r in regs]
     entry_inv = " /\\ ".join(eqs + ["cycle_count_of_trace t' = 0"])
-    hyps = "".join([f"\n         (MEM: s V_MEM32 = mem)"] if printer.uses_mem else []) + \
-        "".join(f"\n         ({r.upper()}: s {RISCV.reg(r)} = {r})" for r in regs)
+    hyps = "".join([f"\n         (MEM: s {arch.mem_var} = mem)"] if printer.uses_mem else []) + \
+        "".join(f"\n         ({r.upper()}: s {arch.reg(r)} = {r})" for r in regs)
     names = (["MEM"] if printer.uses_mem else []) + [r.upper() for r in regs] + ["Cycles"]
     destr = f"destruct PRE as ({' & '.join(names)})." if len(names) > 1 else ""
-    ex = " | ".join(f"{e:#x}" for e in exits)
+    ex = " | ".join(f"{at(e):#x}" for e in exits)
     return f"""(* Generated by TIG (Cloq backend) *)
-{header}
-
-Module TimingProof (cpu : RVCPUTimingBehavior).
-
-Module Program_{name} <: ProgramInformation.
-    Definition entry_addr : N := {func.entry_point:#x}.
-
-    Definition exits (t:trace) : bool :=
-        match t with (Addr a,_)::_ => match a with
-        | {ex} => true
-        | _ => false
-    end | _ => false end.
-
-    Definition binary := {binary}.
-End Program_{name}.
-
-Module RISCVTiming := RISCVTiming cpu Program_{name}.
-Module {name}Auto := RISCVTimingAutomation RISCVTiming.
-Import Program_{name} {name}Auto.
+{proof_preamble(arch, func, exits, header, binary)}
 
 Definition time_of_{name}{binders} (t : trace) :=
     cycle_count_of_trace t =
@@ -619,14 +725,14 @@ Definition time_of_{name}{binders} (t : trace) :=
 Definition {name}_timing_invs{binders}
     (t:trace) : option Prop :=
 match t with (Addr a, s) :: t' => match a with
-| {func.entry_point:#x} => Some ({entry_inv})
+| {at(func.entry_point):#x} => Some ({entry_inv})
 | {ex} => Some (time_of_{name}{(' ' + args) if args else ''} t)
 | _ => None end | _ => None end.
 
 Theorem {name}_timing:
   forall s t s' x'{(' ' + args) if args else ''}
          (ENTRY: startof t (x',s') = (Addr entry_addr, s))
-         (MDL: models rvtypctx s){hyps},
+         (MDL: models {P["typctx"]} s){hyps},
   satisfies_all
     lifted_prog
     ({name}_timing_invs{(' ' + args) if args else ''})
@@ -635,17 +741,12 @@ Theorem {name}_timing:
 Proof using.
     intros.
     apply prove_invs.
-    Local Ltac step := tstep r5_step.
-
+    Local Ltac step := tstep {P["step"]}.
+{ignore}
     simpl. rewrite ENTRY. unfold entry_addr. step. {'auto' if args else 'reflexivity'}.
 
     intros.
-    eapply startof_prefix in ENTRY; try eassumption.
-    eapply preservation_exec_prog in MDL;
-        try eassumption; [idtac|apply lift_riscv_welltyped].
-    clear - ENTRY PRE MDL. rename t1 into t. rename s1 into s'.
-
-    destruct_inv 32 PRE.
+{proof_setup(arch)}
 
     {destr}
     repeat step; hammer.
@@ -658,3 +759,7 @@ Qed.
 
 End TimingProof.
 """
+
+
+def emit_riscv_proof(func, formula, printer, exits, header, binary):
+    return emit_proof(RISCV(), func, formula, printer, exits, header, binary)
