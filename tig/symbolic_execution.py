@@ -12,6 +12,8 @@ logging.getLogger("cle").setLevel(logging.ERROR)
 # NOTE: Customize CLZ, SimStatePlugin (and legacy memory overwrite)
 import tig.memory_mixins
 
+
+
 def get_project(bin_path: str, 
                 base_addr: int,
                 lang: str = "RISCV:LE:32:default") -> angr.Project:
@@ -42,10 +44,11 @@ def get_project(bin_path: str,
 
     pcode_arch = archinfo.ArchPcode(sparc_lang)
 
+    main_opts = {} if base_addr is None else {'base_addr': base_addr}
     return angr.Project(bin_path, 
                         arch=pcode_arch, 
                         load_options={'auto_load_libs': False, 
-                                      'main_opts': {'base_addr': base_addr}
+                                      'main_opts': main_opts
                                       }
                         )
 
@@ -102,18 +105,19 @@ def make_static_memory_symbolic(
     Note: the naming convention is used in .tig.memory_mixins
     """
     # Get section information
-    data_section = project.loader.main_object.sections_map[".data"]
-    bss_section = project.loader.main_object.sections_map[".bss"]
+    sections = project.loader.main_object.sections_map
+    data_section = sections.get(".data")
+    bss_section = sections.get(".bss")
 
     # Process .data section
-    for addr in range(data_section.min_addr, data_section.max_addr, chunk_size):
+    for addr in (range(data_section.min_addr, data_section.max_addr, chunk_size) if data_section else []):
         sym_name = f"data_init_{hex(addr)}"
         symbolic_value = state.solver.BVS(sym_name, chunk_size * 8)
         # NOTE: Reverse for little-endian
         state.memory.store(addr, symbolic_value.reversed)
 
     # Process .bss section
-    for addr in range(bss_section.min_addr, bss_section.max_addr, chunk_size):
+    for addr in (range(bss_section.min_addr, bss_section.max_addr, chunk_size) if bss_section else []):
         sym_name = f"bss_init_{hex(addr)}"
         symbolic_value = state.solver.BVS(sym_name, chunk_size * 8)
         # NOTE: Reverse for little-endian
@@ -193,7 +197,8 @@ class NonTermAvoid(angr.exploration_techniques.ExplorationTechnique):
         state.inspect.b("call", when=angr.BP_BEFORE, action=check_calling_non_term)
 
 
-def hook_symmem(state: angr.SimState, func: Function, verbose: bool = False) -> None:
+def hook_symmem(state: angr.SimState, func: Function, verbose: bool = False,
+                state_args=None, snapshots=None) -> None:
     """ Hook tig.memory_mixins.SymMemPlugin operations """
     state.register_plugin('sym_mem', tig.memory_mixins.SymMemPlugin())
 
@@ -314,6 +319,20 @@ def hook_symmem(state: angr.SimState, func: Function, verbose: bool = False) -> 
                 print("\n->", hex(instr_addr), "??")
         if instr_addr in func.block_dict:
             state.get_plugin("sym_mem").bbl_history.append(instr_addr)
+        # Cloq backend: capture the pre-instruction values of the registers that
+        # this instruction's timing depends on (e.g. RISC-V sll/clz read rd).
+        if state_args is not None and instr is not None:
+            regs = state_args(instr)
+            if regs:
+                key = (tuple(state.get_plugin("sym_mem").bbl_history), instr_addr)
+                vals = tuple(state.registers.load(r, inspect=False, disable_actions=True) for r in regs)
+                state.globals["tig_state_args"] = {**state.globals.get("tig_state_args", {}), key: vals}
+        # Cloq backend: snapshot the general-purpose registers at loop headers,
+        # once per visit, to recover induction variables and loop-invariant values.
+        if snapshots and instr_addr in snapshots[0]:
+            key = tuple(state.get_plugin("sym_mem").bbl_history)
+            vals = {r: state.registers.load(r, inspect=False, disable_actions=True) for r in snapshots[1]}
+            state.globals["tig_snapshots"] = {**state.globals.get("tig_snapshots", {}), key: vals}
         # May be useful for fine-grained records?
         state.get_plugin("sym_mem").history[instr_addr] = []
 
@@ -331,7 +350,12 @@ def hook_symmem(state: angr.SimState, func: Function, verbose: bool = False) -> 
 def exec_func(p: angr.Project, 
               func: Function, 
               non_term_funcs: List[int], 
-              verbose: bool = False) -> Dict:
+              verbose: bool = False,
+              state_args=None,
+              loop_bound: int = 5,
+              snapshots=None,
+              extra_exits=(),
+              lazy_solves: bool = False) -> Dict:
     """Symbolically executes a function and computes input constraints
 
     Args:
@@ -370,11 +394,14 @@ def exec_func(p: angr.Project,
             }
     )
 
+    if lazy_solves:
+        # skip per-branch feasibility checks (Z3 can stall on symbolic-index loads)
+        state.options.add(angr.options.LAZY_SOLVES)
     make_static_memory_symbolic(p, state, chunk_size=4)
 
     #init_regs = make_registers_symbolic(p, state, reg_size=8)
 
-    hook_symmem(state, func, verbose)
+    hook_symmem(state, func, verbose, state_args, snapshots)
 
     sm = p.factory.simgr(state)
 
@@ -385,16 +412,24 @@ def exec_func(p: angr.Project,
         print("Regions:", [f"({hex(a)}, {hex(b)})" for a,b in regions])
         print()
 
-    in_regions = lambda addr: any([e <= addr <= r for e, r in regions])
-    cfg = p.analyses.CFGFast()
-
-    sm.use_technique(angr.exploration_techniques.LoopSeer(cfg=cfg, bound=5))
+    # A path stays inside the function iff it is in one of the function's
+    # blocks.  (Comparing against [entry, return] wrongly discards blocks the
+    # compiler places after the return instruction, e.g. outlined branches.)
+    block_ranges = [(b.start_vaddr, b.start_vaddr + b.size) for b in func.blocks]
+    in_regions = lambda addr: any(lo <= addr < hi for lo, hi in block_ranges)
+    try:
+        cfg = p.analyses.CFGFast()
+        sm.use_technique(angr.exploration_techniques.LoopSeer(cfg=cfg, bound=loop_bound))
+    except AttributeError:
+        # angr's CFG recovery assumes its native ARM arch; for pcode ARM bound
+        # paths by length instead (loops are still unrolled, then reported).
+        sm.use_technique(angr.exploration_techniques.LengthLimiter(max_length=4 * loop_bound))
     # NonTermAvoid check and move states to avoid, must come first
     sm.use_technique(NonTermAvoid(non_term_funcs, verbose=verbose))
     sm.use_technique(StashMonitor(verbose=verbose))
 
     sm.explore(
-        find=func.return_addrs,
+        find=list(func.return_addrs) + list(extra_exits),
         # change this eventually, we do want function calls but we want to step over them if possible
         avoid=(lambda s: not (in_regions(s.addr))), 
         num_find=100,
@@ -413,6 +448,9 @@ def exec_func(p: angr.Project,
         "branch_constraints": state.get_plugin("sym_mem").branch_constraints,
         "branch_history": state.get_plugin("sym_mem").recorded_history,
         "registers": state.get_plugin("sym_mem").register_references, # Used for proof synthesis
+        # Cloq backend
+        "mem_reads": state.get_plugin("sym_mem").mem_read_asts,
+        "avoided": [s.addr for s in sm.stashes.get("avoid", []) if s.addr is not None],
     }
 
     for s in sm.found:
@@ -425,6 +463,9 @@ def exec_func(p: angr.Project,
             "memory_regions": list(s.get_plugin("sym_mem").memory_regions.keys()),
             "path_constraints": s.get_plugin("sym_mem").path_constraints,
             "instruction_args": s.get_plugin("sym_mem").instruction_args,
+            "state_args": s.globals.get("tig_state_args", {}),
+            "snapshots": s.globals.get("tig_snapshots", {}),
+            "constraints": list(s.solver.constraints),
         })
 
     return {"results": results, "info": info}

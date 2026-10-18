@@ -162,8 +162,10 @@ class SymMemPlugin(SimStatePlugin):
                  history={}, 
                  bbl_history=[],
                  instruction_args={},
-                 memory_regions={}):
+                 memory_regions={},
+                 mem_read_asts=None):
         super().__init__()
+        self.mem_read_asts = {} if mem_read_asts is None else mem_read_asts
         self.symbolic_references = symbolic_references
         self.history = history
         self.bbl_history = bbl_history
@@ -182,7 +184,7 @@ class SymMemPlugin(SimStatePlugin):
                 v not in self.symbolic_references and \
                 not v.startswith("CLZ"):
                 # TODO: anything to do here?
-                if not v.startswith("data_init"):
+                if not v.startswith("data_init") and not v.startswith("reg_"):
                     raise NotImplementedError(f"Symbolic variable {v} not expected in constraints")
                 self.variables.append(v)
 
@@ -191,6 +193,7 @@ class SymMemPlugin(SimStatePlugin):
         if symbolic_value.depth == 1 and len(symbolic_value.variables) == 1:
             symbolic_name = list(symbolic_value.variables)[0]
             self.symbolic_references[symbolic_name] = (addr_repr, length)
+            self.mem_read_asts[symbolic_name] = (symbolic_addr, length)
         if addr_repr not in self.memory_regions:
             self.memory_regions[addr_repr] = {"read":[instr_addr], "write":[]}
             self._add_variable(symbolic_value)
@@ -211,6 +214,8 @@ class SymMemPlugin(SimStatePlugin):
         raise NotImplementedError()
 
     def record_register_write(self, reg_name: str, symbolic_value: BV, verbose=False):
+        if not hasattr(symbolic_value, "depth"):
+            return  # concrete write (e.g. pcode context registers on ARM)
         if symbolic_value.depth == 1 and len(symbolic_value.variables) == 1:
             symbolic_name = list(symbolic_value.variables)[0]
             if symbolic_name.startswith("CLZ"):
@@ -218,6 +223,8 @@ class SymMemPlugin(SimStatePlugin):
                 return
             if symbolic_name not in self.symbolic_references:
                 old_name = symbolic_name.rsplit("_", 2)[0]
+                if old_name not in self.symbolic_references:
+                    return  # an initial register copied before anything referenced it
                 self.symbolic_references[symbolic_name] = self.symbolic_references[old_name]
                 if verbose:
                     print(f"  +++++ register write: {reg_name} = {symbolic_value} <- {old_name}")
@@ -232,10 +239,18 @@ class SymMemPlugin(SimStatePlugin):
                             deepcopy(self.history),
                             deepcopy(self.bbl_history),
                             deepcopy(self.instruction_args),
-                            deepcopy(self.memory_regions))
+                            deepcopy(self.memory_regions),
+                            self.mem_read_asts)
 
     def get_repr(self, entry: BV)-> str:
-        value, negate = self._get_repr(entry)
+        if isinstance(entry, int):
+            return hex(entry)  # concrete address
+        # The legacy printer only knows a few operators; the Cloq backend prints
+        # from the ASTs instead, so never abort symbolic execution here.
+        try:
+            value, negate = self._get_repr(entry)
+        except (NotImplementedError, KeyError, ValueError, AttributeError):
+            return f"<unprintable {getattr(entry, 'op', entry)}>"
         if negate:
             value = f"(- {value})"
         return value

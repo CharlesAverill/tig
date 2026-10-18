@@ -59,6 +59,26 @@ def basic_extract_bb(binary_path: str) -> List[Dict[str, Any]]:
     return json.loads(ret)
 
 
+def basic_extract_bb_local(binary_path: str, ghidra_home: str) -> List[Dict[str, Any]]:
+    """Extract basic blocks with a local headless Ghidra instead of Docker."""
+    import tempfile
+    script_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ghidra_scripts")
+    with tempfile.TemporaryDirectory() as work:
+        proj = os.path.join(work, "proj")
+        os.makedirs(proj)
+        res = subprocess.run(
+            [os.path.join(ghidra_home, "support", "analyzeHeadless"), proj, "P",
+             "-deleteProject", "-readOnly", "-max-cpu", "2",
+             "-postScript", "GetBasicBlocks", "-scriptPath", os.path.abspath(script_dir),
+             "-import", os.path.abspath(binary_path)],
+            cwd=work, capture_output=True)
+        out = os.path.join(work, "GetBasicBlocks_result.json")
+        if not os.path.exists(out):
+            raise Exception(f"local Ghidra extraction failed: {res.stdout.decode()[-2000:]}")
+        with open(out) as f:
+            return json.load(f)
+
+
 def execute_objdump(binary, obj_bin="llvm-objdump", offset=0, do_offset=False):
     if do_offset:
         cmd = f"{obj_bin} -d --adjust-vma={offset} -M no-aliases {binary}"
@@ -153,11 +173,26 @@ def extract_bb(
     Returns:
         List[Dict[str, Any]]: A list of function dictionaries loaded from the output JSON and with pseudoinstructions unfolded
     """
-    objdump_results = get_objdump_results(binary_path, objdump, offset)
+    use_objdump = objdump not in (None, "none")
+    objdump_results = get_objdump_results(binary_path, objdump, offset) if use_objdump else {}
 
-    bb = basic_extract_bb(binary_path)
+    ghidra_home = os.environ.get("GHIDRA_HOME")
+    bb = basic_extract_bb_local(binary_path, ghidra_home) if ghidra_home else basic_extract_bb(binary_path)
 
     remove_empty = lambda l: [x for x in l if len(x)]
+
+    if not use_objdump:
+        # Keep Ghidra's own disassembly (used for ISAs whose objdump syntax the
+        # parser below does not understand, e.g. Thumb `#imm` and x86).
+        for func_data in bb:
+            for block in func_data["blocks"]:
+                for instr in block["instructions"]:
+                    instr["operands"] = [o for o in instr["operands"].split(",") if o]
+                    instr["regs_read"] = remove_empty(instr["regs_read"].split(","))
+                    instr["regs_written"] = remove_empty(instr["regs_written"].split(","))
+        with open(out_path, "w") as fd:
+            json.dump(bb, fd, indent=2)
+        return bb
 
     instr_cnt = 0
     for func_data in bb:
@@ -219,6 +254,8 @@ def extract_bb(
 def get_non_terminated_functions(bb_data: List) -> List[Tuple[str,int]]:
     no_terms = []
     for function in bb_data:
+        if not function["blocks"]:
+            continue  # e.g. imported functions with no code in the binary
         has_exit = False
         for block in function["blocks"]:
             if block["is_exit_point"]:
