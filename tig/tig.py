@@ -7,6 +7,7 @@ from typing import Tuple, Optional, Dict, List
 from tig.extract_basic_blocks import extract_bb, get_non_terminated_functions
 from tig.bininfo import Instruction, BasicBlock, Function
 from tig.symbolic_execution import get_project, exec_func
+from tig.proof_synthesis import synthesize_noverlaps_proof
 
 
 def time_of_riscv_instr(
@@ -258,9 +259,6 @@ def generate_timing_invariants(bin_path: str,
     # - Function exit points
     # - Everywhere more than one control-flow paths merge
 
-    # Do preorder traversal of dominator tree to visit all nodes
-    # before a control-flow merge before the merge point
-
     # For each node
 
     p = get_project(bin_path, base_addr)
@@ -295,7 +293,7 @@ def generate_timing_invariants(bin_path: str,
     #     print(f"====={block.start_vaddr}=====")
     #     print(exec_bb(p, block, []))
 
-    return {}
+    return f
 
 
 def main():
@@ -307,6 +305,7 @@ def main():
     parser.add_argument("--objdump", default="riscv32-unknown-elf-objdump", type=str)
     parser.add_argument("--disas", action="store_true")
     parser.add_argument("--out-file", default=None, type=str)
+
     args = parser.parse_args()
 
     if args.disas:
@@ -339,14 +338,15 @@ def main():
 
     base_addr = data[0]["blocks"][0]["bb_start_vaddr"]
 
-    invs = generate_timing_invariants(args.bin, func, base_addr, no_term_func_addrs)
+    result = symexec_function(args.bin, func, base_addr, no_term_func_addrs, verbose=False)
 
-    # invs = rocq_of_invariants(args.func, invs)
-    # if args.out_file is None:
-    #     print(invs)
-    # else:
-    #     with open(args.out_file, "w") as file:
-    #         file.write(invs)
+    rocq = synthesize_noverlaps_proof(func, result["info"], result["results"], verbose=False)
+
+    if args.out_file is None:
+        print(rocq)
+    else:
+        with open(args.out_file, "w") as file:
+            file.write(rocq)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import re
 import sympy as sp
 from collections import defaultdict
 import networkx as nx
-import matplotlib.pyplot as plt
+#import matplotlib.pyplot as plt
 
 GHIDRA_ADDR_OFFSET = 0
 
@@ -18,16 +18,16 @@ def time_of_riscv_instr(mnem, args, store_name, ML):
     condition, true_time, false_time = None, None, None
 
     # Preprocess args into Picinae registers
-    for i in range(len(args)):
-        arg = args[i]
-        if (
-            arg
-            in "ra sp gp tp t0 t1 t2 t3 t4 t5 t6 s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 a0 a1 a2 a3 a4 a5 a6 a7".split(
-                " "
-            )
-        ):
-            arg = f"R_{arg.upper()}"
-        args[i] = arg
+    #for i in range(len(args)):
+    #    arg = args[i]
+    #    if (
+    #        arg
+    #        in "ra sp gp tp t0 t1 t2 t3 t4 t5 t6 s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 a0 a1 a2 a3 a4 a5 a6 a7".split(
+    #            " "
+    #        )
+    #    ):
+    #        arg = f"R_{arg.upper()}"
+    #    args[i] = arg
 
     if mnem in [
         "add",
@@ -48,16 +48,23 @@ def time_of_riscv_instr(mnem, args, store_name, ML):
     ]:
         time = "2"
     elif mnem in ["srl", "sll", "sra"]:
+        raise NotImplementedError(f"Shift instructions {mnem} not implemented")
         time = f"3 + ({store_name} {args[2]} / 4 + {store_name} {args[2]} mod 4)"
     elif mnem == "clz":
-        time = f"3 + clz ({store_name} {args[1]}) 32"
+        #time = f"3 + clz ({store_name} {args[1]}) 32"
+        if args[1] is None:
+            raise ValueError("clz instruction requires an argument")
+        time = f"3 + clz ({args[1]}) 32"
     elif mnem in ["srli", "slli", "srai"]:
-        time = f"3 + args[2] / 4 + args[2] mod 4"
+        raise NotImplementedError(f"Shift instructions {mnem} not implemented")
+        time = f"3 + {args[2]} / 4 + {args[2]} mod 4"
     elif mnem in ["lb", "lh", "lw", "lbu", "lhu", "sb", "sh", "sw"]:
-        time = f"5 + ({ML} - 2)"
+        #time = f"5 + ({ML} - 2)"
+        time = "time_mem"
     elif mnem in ["beq", "bne", "blt", "bge", "bltu", "bgeu"]:
-        true_time = f"5 + ({ML} - 1)"
+        true_time = f"time_branch"
         false_time = "3"
+        # NOTE: not using in time_of_BasicBlock
         op1 = "0" if args[0] == "zero" else f"{store_name} {args[0]}"
         op2 = "0" if args[1] == "zero" else f"{store_name} {args[1]}"
         if mnem == "beq":
@@ -74,7 +81,8 @@ def time_of_riscv_instr(mnem, args, store_name, ML):
             condition = f"negb ({op1} <? {op2})"
         time = f"if {condition} then {true_time} else {false_time}"
     elif mnem in ["jal", "jalr"]:
-        time = f"5 + ({ML} - 1)"
+        #time = f"5 + ({ML} - 1)"
+        time = "time_branch"
     elif mnem in ["mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu"]:
         time = f"36"
     else:
@@ -139,6 +147,75 @@ def time_of_basic_block(block):
         times.append(final_time)
 
     return f"{' + '.join(times)}", condition, true_time, false_time
+
+
+def time_of_BasicBlock(block, 
+                       cur_trace=[], 
+                       cur_instr_args={},
+                       all_traces=[]):
+    def _get_instr_operands(instr, cur_instr_args, cur_trace):
+        args = [None, None, None]
+        if instr.mnem in cur_instr_args:
+            found = False
+            instr_history = cur_trace + [block.start_vaddr, instr.offset]
+            collected = cur_instr_args[instr.mnem]
+            for history, repr, idx in collected:
+                if history == instr_history:
+                    args[idx] = repr
+                    found = True
+            if not found:
+                raise ValueError(
+                    f"Cannot find instruction {instr.mnem} with history {[hex(a) for a in instr_history]} in args"
+                )
+        return args
+
+    times = [
+        time_of_riscv_instr(instr.mnem, 
+                            _get_instr_operands(instr, cur_instr_args, cur_trace),
+                            "s", 
+                            "ML")[0]
+        for instr in block.instructions[:-1]
+    ]
+    times = [f"({time})" if " " in time else time for time in times]
+
+    # Check final instruction for branching
+    final_instr = block.instructions[-1]
+
+    br_instrs = ["beq", "bne", "blt", "bge", "bltu", "bgeu"]
+    if final_instr.mnem in br_instrs:
+        # NOTE: Assume angr's branch guards true-false matches with exact instruction
+        #       Note sure if this is always the case, but it seems to be
+        #       e.g. we have (a == b) for `bne` and (a != b) for `beq`
+        _, _, true_time, false_time = time_of_riscv_instr(
+            final_instr.mnem, final_instr.operands, "s", "ML"
+        )
+        return f"{' + '.join(times)}", True, true_time, false_time
+
+    if final_instr.mnem in ["jal", "jalr"]:
+        # Check return path exists, else infinite
+        # check only one exit_vaddr
+        if len(block.exit_vaddrs) > 1:
+            raise ValueError(f"0x{block.start_vaddr:x} has multiple exit_vaddrs for jal/jalr")
+        if len(block.exit_vaddrs) == 0:
+            check_trace = cur_trace
+        else:
+            check_trace = cur_trace + [block.exit_vaddrs[0]]
+        found = False
+        for trace in all_traces:
+            if len(trace) >= len(check_trace) and trace[: len(check_trace)] == check_trace:
+                found = True
+                break
+        if not found:
+            return "time_inf", None, None, None
+
+    final_time, condition, true_time, false_time = time_of_riscv_instr(
+        final_instr.mnem, final_instr.operands, "s", "ML"
+    )
+    if condition is not None:
+        raise ValueError(f"Shouldn't have condition for {final_instr.mnem}")
+    times.append(final_time)
+
+    return f"{' + '.join(times)}", condition, None, None
 
 
 def time_of_function_basic_blocks(results, function_name):
