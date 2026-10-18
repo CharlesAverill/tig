@@ -394,14 +394,43 @@ def exec_func(p: angr.Project,
             }
     )
 
-    if lazy_solves:
-        # skip per-branch feasibility checks (Z3 can stall on symbolic-index loads)
-        state.options.add(angr.options.LAZY_SOLVES)
-    make_static_memory_symbolic(p, state, chunk_size=4)
+    state = make_static_memory_symbolic(p, state, chunk_size=4)
 
-    #init_regs = make_registers_symbolic(p, state, reg_size=8)
+    state = make_registers_symbolic(p, state, chunk_size=4)
 
-    hook_symmem(state, func, verbose, state_args, snapshots)
+    # For debug printing
+    if verbose:
+        set_debug_inspect(state)
+    
+    # Create sym_mem as plugin so that it can be deep-copied when state forks
+    class SymMapPlugin(angr.SimStatePlugin):
+        def __init__(self, data=None, exprs=None):
+            super().__init__()
+            self.data = data or {}
+            self.exprs = exprs or {}
+
+        def copy(self, memo):
+            return SymMapPlugin(copy.deepcopy(self.data), copy.deepcopy(self.exprs))
+
+    state.register_plugin('sym_mem', SymMapPlugin())
+
+    # Mapping 
+    def symmem_add(state):
+        state.get_plugin("sym_mem").data[state.inspect.symbolic_name] = []
+        state.get_plugin("sym_mem").exprs[state.inspect.symbolic_name] = state.inspect.symbolic_expr
+
+    def symmem_set(state):
+        if len(state.inspect.mem_read_expr.args) == 2:
+            arg0_name = state.inspect.mem_read_expr.args[0]
+            if arg0_name in state.get_plugin("sym_mem").data:
+                state.get_plugin("sym_mem").data[arg0_name].append((hex(state.inspect.instruction), copy.deepcopy(state.inspect.mem_read_address)))
+                #if verbose:
+                #    print(f"  - SYM_MEM: {arg0_name} -> {state.inspect.mem_read_address}" )
+
+    state.inspect.b("symbolic_variable", when=angr.BP_AFTER, action=symmem_add)
+    state.inspect.b("mem_read", when=angr.BP_AFTER, action=symmem_set)
+
+    #state.memory.unconstrained_use_addr = True
 
     sm = p.factory.simgr(state)
 
@@ -434,38 +463,34 @@ def exec_func(p: angr.Project,
         avoid=(lambda s: not (in_regions(s.addr))), 
         num_find=100,
     )
+    # sm.step()
 
-    # NOTE: We could cover the constraints at the end, 
-    #       but I'm not sure if there's anything changed
-    #       for the symbolic variable expansion.
-    #   "path_constraints": s.get_plugin("sym_mem").get_constraint_reprs(s.solver.constraints)        
-    results = []
-    if not sm.found:
-        return {"results": results, "info": {}}
-    state = sm.found[0]
-    info = {
-        "variables": state.get_plugin("sym_mem").variables,
-        "branch_constraints": state.get_plugin("sym_mem").branch_constraints,
-        "branch_history": state.get_plugin("sym_mem").recorded_history,
-        "registers": state.get_plugin("sym_mem").register_references, # Used for proof synthesis
-        # Cloq backend
-        "mem_reads": state.get_plugin("sym_mem").mem_read_asts,
-        "avoided": [s.addr for s in sm.stashes.get("avoid", []) if s.addr is not None],
-    }
+    def dedup_constraints(constraint_sets):
+        out = []
+        seen = set()
+        for addr, c, sym_mem, exprs in constraint_sets:
+            if str(c) not in seen:
+                seen.add(repr(c))
+                new_sym_mem = {}
+                new_exprs = {}
+                for sym, ptr in sym_mem.items():
+                    if not ptr:
+                        continue
+                    # TODO: I believe we only need to keep the last update
+                    #if len(ptr) > 1:
+                    #    raise NotImplementedError("More than one sym mem mapping. Check!")
+                    new_sym_mem[sym] = ptr[-1][1]
+                for name,val in exprs.items():
+                    if not name:
+                        continue
+                    new_exprs[name] = val
+                out.append((addr, c, new_sym_mem, new_exprs))
+        return out
 
-    for s in sm.found:
-        # NOTE: cannot use s.history.bbl_addrs directly as angr will ignore last block 
-        #       if it's exactly the return address
-        print(f"Path to {hex(s.addr)}:", " -> ".join([hex(a) for a in s.get_plugin("sym_mem").bbl_history]))
-        results.append({
-            "end_address": s.addr,
-            "bb_history": s.get_plugin("sym_mem").bbl_history, 
-            "memory_regions": list(s.get_plugin("sym_mem").memory_regions.keys()),
-            "path_constraints": s.get_plugin("sym_mem").path_constraints,
-            "instruction_args": s.get_plugin("sym_mem").instruction_args,
-            "state_args": s.globals.get("tig_state_args", {}),
-            "snapshots": s.globals.get("tig_snapshots", {}),
-            "constraints": list(s.solver.constraints),
-        })
+    for s in sm.active + sm.found:
+        s.solver.simplify()
 
-    return {"results": results, "info": info}
+    return dedup_constraints([(s.addr, 
+                               s.solver.constraints, 
+                               s.get_plugin("sym_mem").data, 
+                               s.get_plugin("sym_mem").exprs ) for s in sm.found] )
